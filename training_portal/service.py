@@ -30,9 +30,25 @@ PAUSE_MAX_SECONDS = 300.0
 CLEANUP_IDLE_SECONDS = 0.5
 CLEANUP_RETRY_SECONDS = 1.5
 
+# Replacement written into generated CSVs wherever a registered phrase hits.
+REDACTED_PLACEHOLDER = "[已遮蔽]"
+MAX_PHRASE_LENGTH = 200
+
 
 class ValidationError(Exception):
     pass
+
+
+def apply_redactions(text: str, phrases: list[str]) -> str:
+    """Replace every literal occurrence of each phrase with the placeholder.
+
+    Applied to a copy only: the utterances table always keeps the original
+    text so withdrawal checks and future re-generations see the source.
+    """
+    for phrase in phrases:
+        if phrase:
+            text = text.replace(phrase, REDACTED_PLACEHOLDER)
+    return text
 
 
 @dataclass
@@ -417,6 +433,131 @@ class Portal:
         return sorted(ids)
 
     # ------------------------------------------------------------------
+    # redaction rules
+    # ------------------------------------------------------------------
+    def add_redaction_rule(self, batch: str, phrase: str) -> dict[str, Any]:
+        """Register a literal phrase to mask out of one batch's exports.
+
+        Everything that must be true the moment the rule exists commits in a
+        single ``BEGIN IMMEDIATE`` transaction: the rule row, the lockdown of
+        every existing export of the batch that still contains the phrase, and
+        the blocking of in-flight jobs whose temp files were written under the
+        old rules. If any of that fails the whole save rolls back, so there is
+        no state where the rule is effective but old content stays
+        downloadable. Actual file deletion is delegated to the cleanup worker;
+        ``pending_delete`` rows are never served meanwhile, and failed
+        deletions are retried without ever re-opening the file.
+
+        Queued jobs are left alone on purpose: they have written nothing yet
+        and will pick the new rules up when they start.
+        """
+        batch = batch.strip()
+        phrase = phrase.strip()
+        if not batch:
+            raise ValidationError("请选择批次")
+        if not phrase:
+            raise ValidationError("遮蔽短语不能为空")
+        if len(phrase) > MAX_PHRASE_LENGTH:
+            raise ValidationError(f"遮蔽短语过长（最多 {MAX_PHRASE_LENGTH} 字）")
+        if "\n" in phrase or "\r" in phrase:
+            raise ValidationError("遮蔽短语不能包含换行")
+        if phrase == REDACTED_PLACEHOLDER:
+            raise ValidationError("遮蔽短语不能是占位符本身")
+
+        now = utc_now()
+        with self.db.transaction() as conn:
+            known = conn.execute(
+                "SELECT 1 FROM batches WHERE name = ?", (batch,)
+            ).fetchone()
+            if not known:
+                raise ValidationError(f"批次 {batch} 不存在，请先上传该批次语料")
+
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO redaction_rules(batch, phrase, created_at) "
+                "VALUES (?, ?, ?)",
+                (batch, phrase, now),
+            )
+            created = cursor.rowcount > 0
+
+            # Lock every still-downloadable export of this batch whose text
+            # column contains the phrase. Exports of other batches and exports
+            # of this batch without the phrase stay downloadable.
+            candidates = conn.execute(
+                "SELECT id, stored_name FROM exports "
+                "WHERE batch = ? AND status = 'ready'",
+                (batch,),
+            ).fetchall()
+            locked = 0
+            for row in candidates:
+                if self._export_contains_phrase(row["stored_name"], phrase):
+                    locked += conn.execute(
+                        "UPDATE exports SET status = 'pending_delete', "
+                        "purge_reason = ?, last_delete_error = NULL "
+                        "WHERE id = ? AND status = 'ready'",
+                        (f"批次新增遮蔽规则「{phrase}」", int(row["id"])),
+                    ).rowcount
+
+            # In-flight files of this batch were (partly) written under the old
+            # rules and must not be published; the workers notice the status
+            # change and discard their temp files.
+            blocked_jobs = conn.execute(
+                "UPDATE jobs SET status = 'blocked', finished_at = ?, message = ? "
+                "WHERE batch = ? AND status IN ('running', 'paused')",
+                (
+                    now,
+                    f"批次新增遮蔽规则「{phrase}」，按旧规则生成的结果不发布",
+                    batch,
+                ),
+            ).rowcount
+
+        if locked:
+            self.kick_cleanup()
+        return {
+            "batch": batch,
+            "phrase": phrase,
+            "created": created,
+            "locked_exports": locked,
+            "blocked_jobs": blocked_jobs,
+        }
+
+    def _export_contains_phrase(self, stored_name: str, phrase: str) -> bool:
+        """Whether the export's text column still contains the literal phrase.
+
+        The file is the source of truth: it is exactly what a download would
+        serve, and it predates the rule (files written after the rule are
+        already masked). Any read/parse failure answers ``True`` - when the
+        content cannot be verified clean, the safe outcome is to lock it.
+        """
+        path = self.export_dir / stored_name
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for record in reader:
+                    text = record.get(TEXT_COLUMN)
+                    if text and phrase in text:
+                        return True
+        except (OSError, csv.Error, UnicodeDecodeError):
+            return True
+        return False
+
+    def redaction_rules(self) -> list[dict[str, Any]]:
+        with self.db.read() as conn:
+            rows = conn.execute(
+                "SELECT id, batch, phrase, created_at FROM redaction_rules "
+                "ORDER BY batch, id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _phrases_for_batch(self, conn: sqlite3.Connection, batch: str) -> list[str]:
+        return [
+            row["phrase"]
+            for row in conn.execute(
+                "SELECT phrase FROM redaction_rules WHERE batch = ? ORDER BY id",
+                (batch,),
+            )
+        ]
+
+    # ------------------------------------------------------------------
     # generation jobs
     # ------------------------------------------------------------------
     def create_job(self, batch: str) -> int:
@@ -544,10 +685,14 @@ class Portal:
     ) -> dict[str, Any] | None:
         """Stream one batch to a temp file, re-checking consent every chunk.
 
-        If anyone in the batch revokes mid-run the whole run is abandoned:
-        their text is interleaved with everyone else's, so publishing the
-        remaining rows would still leak it into prompts. The temp file is never
-        published. Returns ``None`` when the job was blocked.
+        The batch's redaction rules are read once at the start and applied to
+        every text written; the database keeps the originals. A rule saved
+        after this point blocks the job (it is ``running``), so a temp file can
+        never mix old and new rules. If anyone in the batch revokes mid-run
+        the whole run is abandoned: their text is interleaved with everyone
+        else's, so publishing the remaining rows would still leak it into
+        prompts. The temp file is never published. Returns ``None`` when the
+        job was blocked.
         """
         respondents: set[str] = set()
         hashes: set[str] = set()
@@ -555,6 +700,7 @@ class Portal:
         abort_reason: str | None = None
 
         with self.db.read() as conn:
+            phrases = self._phrases_for_batch(conn, batch)
             total = int(
                 conn.execute(
                     "SELECT COUNT(*) AS c FROM utterances WHERE batch = ?", (batch,)
@@ -581,9 +727,14 @@ class Portal:
                     break
                 for row in chunk:
                     cursor = int(row["id"])
-                    writer.writerow([batch, row["respondent_id"], row["text"]])
+                    original = row["text"]
+                    writer.writerow(
+                        [batch, row["respondent_id"], apply_redactions(original, phrases)]
+                    )
                     respondents.add(row["respondent_id"])
-                    hashes.add(text_hash(row["text"]))
+                    # Hashes track the ORIGINAL text: withdrawal matching must
+                    # keep working regardless of what was masked on the way out.
+                    hashes.add(text_hash(original))
                     written += 1
                 with self.db.transaction() as conn:
                     conn.execute(
@@ -624,7 +775,7 @@ class Portal:
                 "SELECT status FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
             if job is None or job["status"] not in ("running", "paused", "queued"):
-                return "任务已因撤回被中止，结果不发布"
+                return "任务已因撤回或遮蔽规则变更被中止，结果不发布"
             revoked = conn.execute(
                 "SELECT DISTINCT u.respondent_id FROM utterances u "
                 "JOIN revocations r ON r.respondent_id = u.respondent_id "
@@ -755,7 +906,7 @@ class Portal:
             if export is None:
                 return None, "", "导出文件不存在"
             if export["status"] == "deleted":
-                return None, "", "文件已按撤回要求删除"
+                return None, "", "文件已按撤回或遮蔽要求删除"
 
             revoked_ids = {
                 row["respondent_id"]
@@ -996,9 +1147,13 @@ class Portal:
             revocations = int(
                 conn.execute("SELECT COUNT(*) AS c FROM revocations").fetchone()["c"]
             )
+            rules = int(
+                conn.execute("SELECT COUNT(*) AS c FROM redaction_rules").fetchone()["c"]
+            )
         return {
             "batches": batches,
             "utterances": utterances,
             "revocations": revocations,
+            "rules": rules,
             "pending": self.pending_cleanup_count(),
         }

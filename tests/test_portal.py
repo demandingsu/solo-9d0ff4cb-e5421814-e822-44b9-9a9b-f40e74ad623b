@@ -426,3 +426,271 @@ def test_download_blocks_text_withdrawn_before_export(portal):
             break
         time.sleep(0.05)
     assert row["status"] == "deleted"
+
+
+# ---------------------------------------------------------------------------
+# redaction rules (遮蔽)
+# ---------------------------------------------------------------------------
+CSV_ORGS = """batch,respondent_id,text
+B1,R1,我在康宁护理院做了三年护工
+B1,R2,孩子考上了市第一中学
+B1,R3,社区食堂的师傅手艺不错
+B2,R4,康宁护理院对面的早餐铺
+"""
+
+
+def read_export(instance: Portal, export_id: int) -> str:
+    handle, _name, error = instance.open_download(export_id)
+    assert error is None and handle is not None
+    content = handle.read().decode("utf-8")
+    handle.close()
+    return content
+
+
+def test_redaction_masks_generated_csv_and_db_keeps_original(portal):
+    upload(portal, CSV_ORGS)
+    portal.add_redaction_rule("B1", "康宁护理院")
+    job = portal.create_job("B1")
+    wait_for(portal, job)
+
+    content = read_export(portal, portal.exports()[0]["id"])
+    assert "康宁护理院" not in content
+    assert "[已遮蔽]" in content
+    # 未登记的短语与其余已授权原话原样保留
+    assert "市第一中学" in content
+    assert "社区食堂的师傅手艺不错" in content
+    # 库内保留原文，供撤回核查
+    with portal.db.read() as conn:
+        texts = [row["text"] for row in conn.execute("SELECT text FROM utterances")]
+    assert any("康宁护理院" in text for text in texts)
+
+
+def test_rule_locks_only_exports_containing_phrase(portal):
+    upload(portal, "batch,respondent_id,text\nB1,R1,普通的访谈正文\n")
+    wait_for(portal, portal.create_job("B1"))
+    upload(portal, "batch,respondent_id,text\nB1,R2,提到了康宁护理院的访谈\n")
+    wait_for(portal, portal.create_job("B1"))
+    upload(portal, "batch,respondent_id,text\nB2,R9,提到康宁护理院的另一批次\n")
+    wait_for(portal, portal.create_job("B2"))
+
+    clean_b1, dirty_b1, other_batch = sorted(portal.exports(), key=lambda e: e["id"])
+    result = portal.add_redaction_rule("B1", "康宁护理院")
+    assert result["created"] is True
+    assert result["locked_exports"] == 1
+
+    # 含相关原文的旧导出立即禁下载并进入清理
+    handle, _n, error = portal.open_download(dirty_b1["id"])
+    assert handle is None and error
+    row = next(e for e in portal.exports() if e["id"] == dirty_b1["id"])
+    assert row["status"] in ("pending_delete", "deleted")
+    # 不含该短语的同批次旧导出仍可下载
+    assert "普通的访谈正文" in read_export(portal, clean_b1["id"])
+    # 无关批次即使含该短语也照常可下载
+    assert "康宁护理院" in read_export(portal, other_batch["id"])
+
+
+def test_generation_after_rule_uses_new_rules(portal):
+    upload(portal, CSV_ORGS)
+    portal.add_redaction_rule("B1", "康宁护理院")
+    portal.add_redaction_rule("B1", "市第一中学")
+    wait_for(portal, portal.create_job("B1"))
+
+    content = read_export(portal, portal.exports()[0]["id"])
+    assert "康宁护理院" not in content
+    assert "市第一中学" not in content
+    assert content.count("[已遮蔽]") == 2
+    assert "社区食堂" in content
+
+
+def test_upload_after_rule_is_masked_on_next_generation(portal):
+    upload(portal, "batch,respondent_id,text\nB1,R1,普通正文\n")
+    portal.add_redaction_rule("B1", "康宁护理院")
+    # 规则生效后上传的同批次语料，生成时同样按新规则遮蔽
+    upload(portal, "batch,respondent_id,text\nB1,R2,后来去了康宁护理院工作\n")
+    wait_for(portal, portal.create_job("B1"))
+
+    content = read_export(portal, portal.exports()[0]["id"])
+    assert "康宁护理院" not in content
+    assert "[已遮蔽]" in content
+
+
+def test_redaction_replaces_every_occurrence(portal):
+    upload(portal, "batch,respondent_id,text\nB1,R1,康宁护理院和康宁护理院对面\n")
+    portal.add_redaction_rule("B1", "康宁护理院")
+    wait_for(portal, portal.create_job("B1"))
+
+    content = read_export(portal, portal.exports()[0]["id"])
+    assert "康宁护理院" not in content
+    assert content.count("[已遮蔽]") == 2
+
+
+def test_rule_save_with_unverifiable_export_locks_it_conservatively(portal):
+    """内容核查失败的旧导出按命中处理：宁锁不错放，且清理失败也不可下载。"""
+    upload(portal, CSV_ORGS)
+    wait_for(portal, portal.create_job("B1"))
+    export = portal.exports()[0]
+    path = portal.export_dir / export["stored_name"]
+    # 让规则保存时的文件核查失败：导出文件位置变成一个目录
+    path.unlink()
+    path.mkdir()
+
+    result = portal.add_redaction_rule("B1", "康宁护理院")
+    assert result["locked_exports"] == 1
+    row = next(e for e in portal.exports() if e["id"] == export["id"])
+    assert row["status"] == "pending_delete"
+
+    # 规则已生效，旧内容绝不可下载
+    handle, _n, error = portal.open_download(export["id"])
+    assert handle is None and error
+    # 清理失败（目标不是普通文件）时仍然不可下载
+    portal.retry_cleanup_now()
+    row = next(e for e in portal.exports() if e["id"] == export["id"])
+    assert row["status"] == "pending_delete"
+    handle, _n, error = portal.open_download(export["id"])
+    assert handle is None and error
+
+
+def test_rule_blocks_inflight_paused_job(client):
+    """按旧规则制作的在途文件不得发布。"""
+    test_client, instance = client
+    body = "\n".join(f"B1,R{i},第{i}段访谈提到了康宁护理院的情况" for i in range(200))
+    upload(instance, "batch,respondent_id,text\n" + body)
+    instance.db.set_settings({"pause_generation": "1"})
+
+    r = test_client.post("/generate", data={"batch": "B1"})
+    assert r.status_code == 200
+    deadline = time.monotonic() + 5
+    paused = None
+    while time.monotonic() < deadline:
+        paused = next((j for j in instance.jobs() if j["status"] == "paused"), None)
+        if paused:
+            break
+        time.sleep(0.05)
+    assert paused is not None, "job never reached the pause gate"
+
+    r = test_client.post("/redactions", data={"batch": "B1", "phrase": "康宁护理院"})
+    assert r.status_code == 200
+    assert "已登记遮蔽规则" in r.text
+
+    instance.db.set_settings({"pause_generation": "0"})
+    deadline = time.monotonic() + 5
+    settled = None
+    while time.monotonic() < deadline:
+        settled = next(j for j in instance.jobs() if j["id"] == paused["id"])
+        if settled["status"] == "blocked" and not list(instance.tmp_dir.glob("*")):
+            break
+        time.sleep(0.05)
+    assert settled["status"] == "blocked"
+    assert instance.exports() == []
+    assert not list(instance.tmp_dir.glob("*"))
+
+
+def test_queued_job_picks_up_new_rules(tmp_path):
+    """排队中的任务尚未写出内容，启动时按新规则生成。"""
+    instance = Portal(tmp_path / "data")
+    try:
+        upload(instance, CSV_ORGS)
+        job_id = instance.create_job("B1")
+        instance.add_redaction_rule("B1", "康宁护理院")
+        instance.start_workers()
+        wait_for(instance, job_id)
+
+        content = read_export(instance, instance.exports()[0]["id"])
+        assert "康宁护理院" not in content
+        assert "[已遮蔽]" in content
+    finally:
+        instance.shutdown()
+
+
+def test_duplicate_rule_is_idempotent(portal):
+    upload(portal, CSV_ORGS)
+    first = portal.add_redaction_rule("B1", "康宁护理院")
+    assert first["created"] is True
+    again = portal.add_redaction_rule("B1", "康宁护理院")
+    assert again["created"] is False
+    assert len(portal.redaction_rules()) == 1
+
+
+def test_rule_validation(portal):
+    from training_portal.service import ValidationError
+
+    upload(portal, CSV_ORGS)
+    with pytest.raises(ValidationError):
+        portal.add_redaction_rule("B1", "   ")
+    with pytest.raises(ValidationError):
+        portal.add_redaction_rule("B1", "[已遮蔽]")
+    with pytest.raises(ValidationError):
+        portal.add_redaction_rule("B1", "换\n行")
+    with pytest.raises(ValidationError):
+        portal.add_redaction_rule("不存在的批次", "某短语")
+    assert portal.redaction_rules() == []
+
+
+def test_revocation_still_blocks_after_rules(portal):
+    """撤回与遮蔽并存：同号、同文的阻断照常有效。"""
+    upload(portal, CSV_ORGS)
+    portal.add_redaction_rule("B1", "康宁护理院")
+    wait_for(portal, portal.create_job("B1"))
+    export_id = portal.exports()[0]["id"]
+
+    result = portal.revoke("R3")
+    assert result["affected_exports"] == 1
+    handle, _n, error = portal.open_download(export_id)
+    assert handle is None and "撤回" in error
+
+    # 同号重传被拒
+    result = upload(portal, "batch,respondent_id,text\nB1,R3,换新文本\n")
+    assert result["skipped_revoked"] == 1
+    # 同文换号重传也被拒（撤回时记录的是原文哈希）
+    result = upload(portal, "batch,respondent_id,text\nB1,R9,社区食堂的师傅手艺不错\n")
+    assert result["skipped_revoked"] == 1
+
+
+def test_index_page_shows_redaction_section(client):
+    test_client, instance = client
+    upload(instance, CSV_ORGS)
+    r = test_client.post("/redactions", data={"batch": "B1", "phrase": "康宁护理院"})
+    assert r.status_code == 200
+    assert "已登记遮蔽规则" in r.text
+
+    r = test_client.get("/")
+    assert r.status_code == 200
+    assert "登记遮蔽短语" in r.text
+    assert "康宁护理院" in r.text
+
+
+def test_http_end_to_end_redaction_flow(client):
+    test_client, instance = client
+    r = test_client.post(
+        "/upload",
+        files={"file": ("orgs.csv", CSV_ORGS.encode("utf-8"), "text/csv")},
+    )
+    assert r.status_code == 200
+    r = test_client.post("/generate", data={"batch": "B1"})
+    assert r.status_code == 200
+    job = wait_for(instance, instance.jobs()[0]["id"])
+    assert job["status"] == "completed"
+    old_export_id = instance.exports()[0]["id"]
+
+    r = test_client.get(f"/download/{old_export_id}")
+    assert r.status_code == 200
+    assert "康宁护理院" in r.text
+
+    r = test_client.post("/redactions", data={"batch": "B1", "phrase": "康宁护理院"})
+    assert r.status_code == 200
+
+    # 旧导出立即禁下载
+    r = test_client.get(f"/download/{old_export_id}")
+    assert r.status_code in (404, 410)
+
+    # 重新生成：新导出按新规则遮蔽
+    r = test_client.post("/generate", data={"batch": "B1"})
+    assert r.status_code == 200
+    job = wait_for(instance, instance.jobs()[0]["id"])
+    assert job["status"] == "completed"
+    new_export = instance.exports()[0]
+    assert new_export["id"] != old_export_id
+    r = test_client.get(f"/download/{new_export['id']}")
+    assert r.status_code == 200
+    assert "康宁护理院" not in r.text
+    assert "[已遮蔽]" in r.text

@@ -97,6 +97,7 @@ def page(request: Request, **context: object):
         exports=portal.exports(),
         revocations=portal.revocations(),
         uploads=portal.uploads(),
+        rules=portal.redaction_rules(),
         **context,
     )
 
@@ -143,6 +144,24 @@ def generate(request: Request, batch: str = Form("")):
     try:
         job_id = portal.create_job(batch)
         return page(request, notice=f"已提交生成任务 #{job_id}（批次 {batch}）")
+    except ValidationError as exc:
+        return page(request, error=str(exc))
+
+
+@app.post("/redactions")
+def add_redaction(request: Request, batch: str = Form(""), phrase: str = Form("")):
+    try:
+        result = portal.add_redaction_rule(batch, phrase)
+        if result["created"]:
+            parts = [f"已登记遮蔽规则（批次 {result['batch']}）：「{result['phrase']}」，即刻生效"]
+        else:
+            parts = [f"批次 {result['batch']} 已存在相同规则，已重新核查旧导出"]
+        if result["locked_exports"]:
+            parts.append(f"锁定旧导出 {result['locked_exports']} 个并转入清理")
+        if result["blocked_jobs"]:
+            parts.append(f"中止在途任务 {result['blocked_jobs']} 个")
+        parts.append("此后该批次生成的 CSV 将按新规则遮蔽，库内保留原文")
+        return page(request, notice="；".join(parts) + "。")
     except ValidationError as exc:
         return page(request, error=str(exc))
 
@@ -206,9 +225,10 @@ def cleanup_retry(request: Request):
 def download(export_id: int):
     handle, name, error = portal.open_download(export_id)
     if error or handle is None:
+        gone = any(word in (error or "") for word in ("撤回", "遮蔽"))
         return JSONResponse(
             {"ok": False, "error": error or "无法下载"},
-            status_code=410 if "撤回" in (error or "") else 404,
+            status_code=410 if gone else 404,
         )
 
     def body():

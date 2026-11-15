@@ -10,7 +10,7 @@
   <header class="masthead">
     <div class="wrap">
       <h1>访谈语料训练分发平台</h1>
-      <p class="sub">上传访谈 CSV · 后台生成训练集 · 撤回授权即时生效</p>
+      <p class="sub">上传访谈 CSV · 按批次遮蔽未许可短语 · 撤回授权即时生效</p>
     </div>
   </header>
 
@@ -21,6 +21,7 @@
     <section class="statrow">
       <div class="stat"><span class="num">{{ stats.batches }}</span><span>批次</span></div>
       <div class="stat"><span class="num">{{ stats.utterances }}</span><span>语料行</span></div>
+      <div class="stat"><span class="num">{{ stats.rules }}</span><span>遮蔽规则</span></div>
       <div class="stat"><span class="num">{{ stats.revocations }}</span><span>已撤回编号</span></div>
       <div class="stat {% if stats.pending %}stat-danger{% endif %}">
         <span class="num">{{ stats.pending }}</span><span>待清理文件</span>
@@ -69,7 +70,34 @@
       </section>
 
       <section class="card">
-        <h2>3. 撤回受访者授权</h2>
+        <h2>3. 登记遮蔽短语</h2>
+        <p class="hint">某批语料含未获公开许可的机构名等字面短语时，按批次登记。登记即刻生效：含该短语的旧导出立即禁下载并转入清理；按旧规则生成的在途任务不发布；此后该批次生成的 CSV 把所有命中片段替换为 <code>[已遮蔽]</code>。库内始终保留原文，供撤回核查。</p>
+        {% if batches %}
+        <form method="post" action="/redactions" class="stack">
+          <select name="batch" required>
+            {% for b in batches %}
+            <option value="{{ b.name }}">{{ b.name }}</option>
+            {% endfor %}
+          </select>
+          <div class="row">
+            <input type="text" name="phrase" placeholder="需遮蔽的字面短语，例如 康宁护理院" required maxlength="200">
+            <button type="submit" class="btn">登记并生效</button>
+          </div>
+        </form>
+        {% else %}
+        <p class="hint">尚无批次，请先上传 CSV。</p>
+        {% endif %}
+        {% if rules %}
+        <ul class="rulelist">
+          {% for r in rules %}
+          <li><span class="mono">{{ r.batch }}</span><span class="rulephrase">「{{ r.phrase }}」</span><span class="hint small">{{ r.created_at | short_time }}</span></li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+      </section>
+
+      <section class="card">
+        <h2>4. 撤回受访者授权</h2>
         <p class="hint">撤回立即持久生效：删除该编号的全部语料行，锁定并清理所有包含其文本的导出文件；之后上传同号（或其原文）都不会重新纳入。</p>
         <form method="post" action="/revoke" class="row">
           <input type="text" name="respondent_id" placeholder="受访者编号，例如 R-1001" required>
@@ -138,7 +166,7 @@
       <div class="tablewrap">
         <table>
           <thead>
-            <tr><th>文件</th><th>批次</th><th>行数</th><th>状态</th><th>撤回 / 清理原因</th><th>删除尝试</th><th></th></tr>
+            <tr><th>文件</th><th>批次</th><th>行数</th><th>状态</th><th>撤回 / 遮蔽 / 清理原因</th><th>删除尝试</th><th></th></tr>
           </thead>
           <tbody>
             {% for e in exports %}
@@ -213,6 +241,10 @@
     <section class="notes">
       <h2>行为说明</h2>
       <ul>
+        <li><strong>遮蔽规则即刻生效：</strong>规则写入、旧导出锁定、在途任务中止在同一个 SQLite 写事务中提交；任何一步失败都整体回滚，不会出现「规则已生效而旧内容仍可下载」的状态。</li>
+        <li><strong>只遮蔽命中内容：</strong>仅锁定该批次文本列仍含该短语的旧导出；不含该短语的同批次导出与无关批次的导出照常可下载。</li>
+        <li><strong>库内保留原文：</strong>遮蔽只发生在生成 CSV 时，数据库始终保存原始文本，撤回核查与后续重新生成都以原文为准；此后上传的同批次语料同样按新规则生成。</li>
+        <li><strong>在途文件不发布：</strong>规则生效时正在生成或停在「演示暂停」的同批次任务被标记「已阻止」，临时文件删除；排队中的任务尚未写出内容，启动时自动按新规则生成。</li>
         <li><strong>撤回先持久化：</strong>撤回记录、语料行删除、导出锁定与任务中止在同一个 SQLite 写事务中提交，任何读取路径都不会看到「已撤回但仍可导出」的中间态。</li>
         <li><strong>重新上传不复活：</strong>上传时按受访者编号过滤，已撤回行计入「跳过撤回」。撤回后再次上传同号不会重新纳入。</li>
         <li><strong>生成中撤回：</strong>生成按 20 行一个分块，每块前重读撤回表；批次内任一编号被撤回即中止整个任务（其文本与其他语料交错，只删其行仍会泄漏），结果不发布。</li>

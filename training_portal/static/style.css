@@ -45,7 +45,7 @@ main { padding: 22px 20px 60px; }
 
 .statrow {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 18px;
 }
@@ -136,6 +136,19 @@ input[type="file"] { width: 100%; padding: 8px; }
 .btn-small { padding: 5px 10px; font-size: 13px; }
 
 .samples { margin-top: 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+.rulelist {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 12px 0 0;
+  border-top: 1px dashed var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 13px;
+}
+.rulelist li { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.rulelist .rulephrase { color: var(--warn); }
 
 .tablewrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13.5px; }

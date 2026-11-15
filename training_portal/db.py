@@ -122,6 +122,20 @@ CREATE TABLE IF NOT EXISTS export_text_hashes (
 CREATE INDEX IF NOT EXISTS idx_export_text_hashes_hash
     ON export_text_hashes(text_hash);
 
+-- Literal phrases that must be masked out of one batch's exports. The corpus
+-- itself keeps the original text; rules are applied only when an export is
+-- generated, and saving a rule retroactively locks old exports that contain
+-- the phrase.
+CREATE TABLE IF NOT EXISTS redaction_rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch       TEXT NOT NULL,
+    phrase      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE(batch, phrase)
+);
+
+CREATE INDEX IF NOT EXISTS idx_redaction_rules_batch ON redaction_rules(batch);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
